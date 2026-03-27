@@ -1,0 +1,31 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+metadata:
+  name: confused-country-ladybug
+  region: us-east-2
+  version: "1.35"
+
+vpc:
+  id: vpc-02cd03d9675f220e6
+  securityGroup: sg-0596acf76d52315e1
+  subnets:
+    private:
+      us-east-2a:
+        id: subnet-0c80385f5ea9602dc
+      us-east-2b:
+        id: subnet-0f3378be916ce7762
+      us-east-2c:
+        id: subnet-03954e16f5f9ef86a
+
+managedNodeGroups:
+  - name: standard
+    instanceType: t3.medium
+    desiredCapacity: 2
+    minSize: 0
+    maxSize: 3
+    volumeSize: 30
+    privateNetworking: true
+    subnets:
+      - subnet-0c80385f5ea9602dc
+      - subnet-0f3378be916ce7762
+      - subnet-03954e16f5f9ef86a

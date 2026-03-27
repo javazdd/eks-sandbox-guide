@@ -1,6 +1,6 @@
-# EKS Sandbox Setup Guide
+# EKS + Observability Pipelines Worker Setup Guide
 
-Step-by-step guide for connecting to and deploying containers on an AWS EKS cluster using `aws-vault`, `eksctl`, and `kubectl`.
+Step-by-step guide for deploying an AWS EKS cluster and running the Datadog Observability Pipelines Worker on it.
 
 ---
 
@@ -14,37 +14,27 @@ Step-by-step guide for connecting to and deploying containers on an AWS EKS clus
 | `aws-vault` | Securely manage AWS credentials |
 | `eksctl` | EKS cluster management |
 | `kubectl` | Kubernetes CLI |
+| `helm` | Deploy the OPW Helm chart |
 
 ### Install via Homebrew
 
 ```bash
-brew install awscli aws-vault eksctl
-```
-
-Verify installations:
-
-```bash
-aws --version
-aws-vault --version
-eksctl version
-kubectl version --client
+brew install awscli aws-vault eksctl helm
 ```
 
 ---
 
 ## AWS Access Setup
 
-You need access to the Datadog ESE sandbox AWS account via AWS SSO.
-
 ### 1. Configure AWS SSO
 
-> **Note:** The `sso_start_url` must be the full AWS portal URL — not a shortlink. To resolve a shortlink:
+> **Note:** The `sso_start_url` must be the full AWS portal URL, not a shortlink. To resolve one:
 > ```bash
 > curl -sI https://dtdg.co/aws-sso-prod | grep -i location
 > # → https://d-906757b57c.awsapps.com/start
 > ```
 
-Add the following profiles to `~/.aws/config`:
+Add profiles to `~/.aws/config`:
 
 ```ini
 [profile ese-sandbox]
@@ -66,10 +56,16 @@ output = json
 
 > **Tip:** To discover what accounts and roles you have access to after logging in:
 > ```bash
-> # List accounts
-> TOKEN=$(python3 -c "import json,glob; f=sorted(glob.glob(os.path.expanduser('~/.aws/sso/cache/*.json')))[0]; d=json.load(open(f)); print(d.get('accessToken',''))")
+> TOKEN=$(python3 -c "
+> import json, glob, os
+> files = glob.glob(os.path.expanduser('~/.aws/sso/cache/*.json'))
+> for f in files:
+>     d = json.load(open(f))
+>     if 'accessToken' in d:
+>         print(d['accessToken'])
+>         break
+> ")
 > aws sso list-accounts --access-token "$TOKEN" --region us-east-1
-> # List roles for an account
 > aws sso list-account-roles --access-token "$TOKEN" --account-id <ACCOUNT_ID> --region us-east-1
 > ```
 
@@ -78,8 +74,6 @@ output = json
 ```bash
 aws sso login --profile ese-sandbox
 ```
-
-This opens a browser for you to authorize. Approve the request.
 
 ### 3. Verify Access
 
@@ -108,12 +102,7 @@ aws-vault exec ese-sandbox -- aws eks --region us-east-2 update-kubeconfig --nam
 
 ```bash
 kubectl config get-contexts
-```
-
-Look for `*` next to the `confused-country-ladybug` context. If it's not active:
-
-```bash
-kubectl config use-context <context-name>
+# Look for * next to confused-country-ladybug
 ```
 
 ### 3. Verify Cluster Access
@@ -126,113 +115,122 @@ aws-vault exec ese-sandbox -- kubectl get nodes
 
 ## Adding a Node Group
 
-A freshly created EKS cluster has no worker nodes. You must add a node group before deploying any workloads.
+A freshly created EKS cluster has no worker nodes. Create a `nodegroup.yaml` with the cluster's VPC details:
 
-```bash
-aws-vault exec ese-sandbox -- eksctl create nodegroup \
-  --cluster confused-country-ladybug \
-  --region us-east-2 \
-  --name standard \
-  --node-type t3.medium \
-  --nodes 2 \
-  --nodes-min 0 \
-  --nodes-max 3 \
-  --node-volume-size 30 \
-  --managed
+> **Tip:** Get the VPC/subnet info from the existing cluster:
+> ```bash
+> aws-vault exec ese-sandbox -- aws eks describe-cluster --name <CLUSTER> --region <REGION> \
+>   --query 'cluster.{vpcId:resourcesVpcConfig.vpcId, subnets:resourcesVpcConfig.subnetIds, sg:resourcesVpcConfig.clusterSecurityGroupId}'
+>
+> aws-vault exec ese-sandbox -- aws ec2 describe-subnets --subnet-ids <IDS> --region <REGION> \
+>   --query 'Subnets[].{id:SubnetId,az:AvailabilityZone,public:MapPublicIpOnLaunch}'
+> ```
+
+```yaml
+# nodegroup.yaml
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+metadata:
+  name: confused-country-ladybug
+  region: us-east-2
+  version: "1.35"
+
+vpc:
+  id: vpc-02cd03d9675f220e6
+  securityGroup: sg-0596acf76d52315e1
+  subnets:
+    private:
+      us-east-2a:
+        id: subnet-0c80385f5ea9602dc
+      us-east-2b:
+        id: subnet-0f3378be916ce7762
+      us-east-2c:
+        id: subnet-03954e16f5f9ef86a
+
+managedNodeGroups:
+  - name: standard
+    instanceType: t3.medium
+    desiredCapacity: 2
+    minSize: 0
+    maxSize: 3
+    volumeSize: 30
+    privateNetworking: true
+    subnets:
+      - subnet-0c80385f5ea9602dc
+      - subnet-0f3378be916ce7762
+      - subnet-03954e16f5f9ef86a
 ```
 
-> This takes 5–10 minutes. Once complete, verify with:
-> ```bash
-> aws-vault exec ese-sandbox -- kubectl get nodes
-> ```
+```bash
+aws-vault exec ese-sandbox -- eksctl create nodegroup -f nodegroup.yaml
+```
+
+> **Note:** If eksctl times out, the node group may still have been created successfully — check with `kubectl get nodes`.
 
 ---
 
-## Deploying Containers
+## Deploy the Observability Pipelines Worker
 
-### Option A: kubectl apply
+### 1. Add the Datadog Helm repo
 
-Create a manifest file (e.g., `deployment.yaml`):
+```bash
+helm repo add datadog https://helm.datadoghq.com
+helm repo update
+```
+
+### 2. Create your values file
 
 ```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: my-app
-  namespace: default
-spec:
-  replicas: 2
-  selector:
-    matchLabels:
-      app: my-app
-  template:
-    metadata:
-      labels:
-        app: my-app
-    spec:
-      containers:
-        - name: my-app
-          image: nginx:latest
-          ports:
-            - containerPort: 80
+# op-values.yaml
+datadog:
+  apiKey: "<DD_API_KEY>"
+  pipelineId: "<DD_OP_PIPELINE_ID>"
+  site: datadoghq.com
+
+replicas: 1
 ```
 
-Apply it:
+> Find your Pipeline ID in the Datadog UI under **Observability Pipelines → your pipeline**.
+
+### 3. Install the Helm chart
 
 ```bash
-aws-vault exec ese-sandbox -- kubectl apply -f deployment.yaml
+aws-vault exec ese-sandbox -- helm install opw datadog/observability-pipelines-worker \
+  -f op-values.yaml
 ```
 
-Verify:
+### 4. Verify the worker is running
 
 ```bash
-aws-vault exec ese-sandbox -- kubectl get pods
-```
-
-### Option B: Helm
-
-```bash
-aws-vault exec ese-sandbox -- helm install my-release my-chart/
+aws-vault exec ese-sandbox -- kubectl get pods -l app.kubernetes.io/instance=opw
+# Expected: opw-observability-pipelines-worker-0   1/1   Running
 ```
 
 ---
 
 ## Useful Aliases
 
-Add these to your `~/.zshrc` or `~/.bashrc`:
-
 ```bash
 alias av='aws-vault exec ese-sandbox --'
 alias avk='aws-vault exec ese-sandbox -- kubectl'
 ```
 
-Then reload:
-
-```bash
-source ~/.zshrc
-```
-
-Usage:
-
 ```bash
 avk get pods
 avk get nodes
-av helm install ...
-av eksctl get nodegroup --cluster confused-country-ladybug --region us-east-2
+av helm list
 ```
 
 ---
 
 ## Scaling Node Groups
 
-Scale down when not in use to save costs:
-
 ```bash
 # List node groups
 aws-vault exec ese-sandbox -- eksctl get nodegroup \
   --cluster confused-country-ladybug --region us-east-2
 
-# Scale down to 0
+# Scale down to 0 (save costs when not in use)
 aws-vault exec ese-sandbox -- eksctl scale nodegroup \
   --name standard --nodes=0 \
   --region us-east-2 --cluster confused-country-ladybug
@@ -247,9 +245,11 @@ aws-vault exec ese-sandbox -- eksctl scale nodegroup \
 
 ## Tear Down
 
-**Always delete your cluster when done** to free up AWS quotas:
-
 ```bash
+# Uninstall OPW
+aws-vault exec ese-sandbox -- helm uninstall opw
+
+# Delete the cluster
 aws-vault exec ese-sandbox -- eksctl delete cluster --name confused-country-ladybug --region us-east-2
 ```
 
