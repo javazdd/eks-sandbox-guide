@@ -1,0 +1,9 @@
+datadog:
+  apiKey: "<DD_API_KEY>"
+  pipelineId: "<DD_OP_PIPELINE_ID>"
+  site: datadoghq.com
+  bootstrap:
+    secretFileContents:
+      SOURCE_DATADOG_AGENT_ADDRESS: "0.0.0.0:8282"
+
+replicas: 1

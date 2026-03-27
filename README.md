@@ -169,6 +169,64 @@ aws-vault exec ese-sandbox -- eksctl create nodegroup -f nodegroup.yaml
 
 ---
 
+## Create an Observability Pipeline via API
+
+The OP worker requires a deployed pipeline configuration to register with Datadog. Pipelines created in the UI start as drafts and must be deployed via the API.
+
+> **Important:** Use `/api/v2/obs-pipelines/pipelines` — not `/api/v2/observability_pipelines/pipelines` (which returns 404).
+
+### 1. Create the pipeline
+
+```bash
+curl -s -X POST "https://api.datadoghq.com/api/v2/obs-pipelines/pipelines" \
+  -H "DD-API-KEY: <DD_API_KEY>" \
+  -H "DD-APPLICATION-KEY: <DD_APP_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "data": {
+      "type": "pipelines",
+      "attributes": {
+        "name": "my-pipeline",
+        "config": {
+          "sources": [
+            {
+              "id": "datadog_agent",
+              "type": "datadog_agent"
+            }
+          ],
+          "destinations": [
+            {
+              "id": "datadog_logs",
+              "type": "datadog_logs",
+              "inputs": ["datadog_agent"]
+            }
+          ]
+        }
+      }
+    }
+  }'
+```
+
+Save the `id` from the response — this is your `<DD_OP_PIPELINE_ID>`.
+
+### 2. List existing pipelines
+
+```bash
+curl -s "https://api.datadoghq.com/api/v2/obs-pipelines/pipelines" \
+  -H "DD-API-KEY: <DD_API_KEY>" \
+  -H "DD-APPLICATION-KEY: <DD_APP_KEY>"
+```
+
+### 3. Verify the pipeline exists
+
+```bash
+curl -s "https://api.datadoghq.com/api/v2/obs-pipelines/pipelines/<PIPELINE_ID>" \
+  -H "DD-API-KEY: <DD_API_KEY>" \
+  -H "DD-APPLICATION-KEY: <DD_APP_KEY>"
+```
+
+---
+
 ## Deploy the Observability Pipelines Worker
 
 ### 1. Add the Datadog Helm repo
@@ -180,17 +238,20 @@ helm repo update
 
 ### 2. Create your values file
 
+The `datadog_agent` source requires the listener address to be passed as a bootstrap secret (`SOURCE_DATADOG_AGENT_ADDRESS`):
+
 ```yaml
 # op-values.yaml
 datadog:
   apiKey: "<DD_API_KEY>"
   pipelineId: "<DD_OP_PIPELINE_ID>"
   site: datadoghq.com
+  bootstrap:
+    secretFileContents:
+      SOURCE_DATADOG_AGENT_ADDRESS: "0.0.0.0:8282"
 
 replicas: 1
 ```
-
-> Find your Pipeline ID in the Datadog UI under **Observability Pipelines → your pipeline**.
 
 ### 3. Install the Helm chart
 
@@ -205,6 +266,47 @@ aws-vault exec ese-sandbox -- helm install opw datadog/observability-pipelines-w
 aws-vault exec ese-sandbox -- kubectl get pods -l app.kubernetes.io/instance=opw
 # Expected: opw-observability-pipelines-worker-0   1/1   Running
 ```
+
+### 5. Check logs to confirm pipeline config loaded
+
+```bash
+aws-vault exec ese-sandbox -- kubectl logs opw-observability-pipelines-worker-0 | grep -E "loaded|Fetching|error"
+# Expected: New configuration loaded successfully.
+```
+
+### Upgrading the worker config
+
+```bash
+aws-vault exec ese-sandbox -- helm upgrade opw datadog/observability-pipelines-worker \
+  -f op-values.yaml
+```
+
+---
+
+## Troubleshooting
+
+### Worker stuck on "Waiting for workers to come online"
+
+The worker will not register if:
+1. **Pipeline not deployed** — the pipeline must be created/deployed via API (not just saved in the UI draft). See [Create an Observability Pipeline via API](#create-an-observability-pipeline-via-api).
+2. **Mismatched org** — the API key and pipeline ID must belong to the same Datadog org. Validate:
+   ```bash
+   curl -s "https://api.datadoghq.com/api/v1/validate" -H "DD-API-KEY: <DD_API_KEY>"
+   # Should return {"valid":true}
+   curl -s "https://api.datadoghq.com/api/v1/org" \
+     -H "DD-API-KEY: <DD_API_KEY>" \
+     -H "DD-APPLICATION-KEY: <DD_APP_KEY>"
+   # Check org name matches where the pipeline was created
+   ```
+3. **Missing bootstrap secret** — `SOURCE_DATADOG_AGENT_ADDRESS` must be set if using the `datadog_agent` source.
+
+### TUF metadata expired warning
+
+You may see this in logs:
+```
+ERROR tuf::client: Root metadata expired, potential freeze attack
+```
+This is a non-blocking warning in current OPW versions and does not prevent the worker from running.
 
 ---
 
