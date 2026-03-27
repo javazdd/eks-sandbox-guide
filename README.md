@@ -34,48 +34,75 @@ kubectl version --client
 
 ## AWS Access Setup
 
-You need access to the Datadog TSE sandbox AWS account (ID: `659775407889`) via AWS SSO.
+You need access to the Datadog ESE sandbox AWS account via AWS SSO.
 
 ### 1. Configure AWS SSO
 
-Follow internal setup docs to get access to the `sso-tse-sandbox-account-admin` profile.
+> **Note:** The `sso_start_url` must be the full AWS portal URL — not a shortlink. To resolve a shortlink:
+> ```bash
+> curl -sI https://dtdg.co/aws-sso-prod | grep -i location
+> # → https://d-906757b57c.awsapps.com/start
+> ```
 
-Your `~/.aws/config` should include a block like:
+Add the following profiles to `~/.aws/config`:
 
 ```ini
-[profile sso-tse-sandbox-account-admin]
-sso_start_url = https://dtdg.co/aws-sso-prod
+[profile ese-sandbox]
+sso_start_url = https://d-906757b57c.awsapps.com/start
 sso_region = us-east-1
-sso_account_id = 659775407889
-sso_role_name = AdministratorAccess
+sso_account_id = 770341584863
+sso_role_name = account-admin
 region = us-east-2
+output = json
+
+[profile tse-playground]
+sso_start_url = https://d-906757b57c.awsapps.com/start
+sso_region = us-east-1
+sso_account_id = 570690476889
+sso_role_name = power-user
+region = us-east-2
+output = json
 ```
 
-### 2. Verify AWS Vault Connection
+> **Tip:** To discover what accounts and roles you have access to after logging in:
+> ```bash
+> # List accounts
+> TOKEN=$(python3 -c "import json,glob; f=sorted(glob.glob(os.path.expanduser('~/.aws/sso/cache/*.json')))[0]; d=json.load(open(f)); print(d.get('accessToken',''))")
+> aws sso list-accounts --access-token "$TOKEN" --region us-east-1
+> # List roles for an account
+> aws sso list-account-roles --access-token "$TOKEN" --account-id <ACCOUNT_ID> --region us-east-1
+> ```
+
+### 2. Log in via SSO
 
 ```bash
-aws-vault exec sso-tse-sandbox-account-admin -- aws s3 ls
+aws sso login --profile ese-sandbox
 ```
 
-This will open a browser prompt to authorize. On success, you'll see a list of S3 buckets.
+This opens a browser for you to authorize. Approve the request.
+
+### 3. Verify Access
+
+```bash
+aws-vault exec ese-sandbox -- aws eks list-clusters --region us-east-2
+```
 
 ---
 
 ## Connect to an Existing EKS Cluster
 
-### Cluster Details (this guide)
+### Cluster Details
 
 - **Cluster name:** `confused-country-ladybug`
 - **Region:** `us-east-2`
+- **Account:** `ese-sandbox` (770341584863)
+- **Kubernetes version:** 1.35
 
 ### 1. Update kubeconfig
 
 ```bash
-aws-vault exec sso-tse-sandbox-account-admin -- \
-  aws eks --region us-east-2 update-kubeconfig --name confused-country-ladybug
+aws-vault exec ese-sandbox -- aws eks --region us-east-2 update-kubeconfig --name confused-country-ladybug
 ```
-
-This adds the cluster context to your local `~/.kube/config`.
 
 ### 2. Verify the Context
 
@@ -83,7 +110,7 @@ This adds the cluster context to your local `~/.kube/config`.
 kubectl config get-contexts
 ```
 
-Look for `*` next to `confused-country-ladybug`. If it's not active:
+Look for `*` next to the `confused-country-ladybug` context. If it's not active:
 
 ```bash
 kubectl config use-context <context-name>
@@ -92,10 +119,32 @@ kubectl config use-context <context-name>
 ### 3. Verify Cluster Access
 
 ```bash
-aws-vault exec sso-tse-sandbox-account-admin -- kubectl get nodes
+aws-vault exec ese-sandbox -- kubectl get nodes
 ```
 
-You should see your worker nodes listed with `Ready` status.
+---
+
+## Adding a Node Group
+
+A freshly created EKS cluster has no worker nodes. You must add a node group before deploying any workloads.
+
+```bash
+aws-vault exec ese-sandbox -- eksctl create nodegroup \
+  --cluster confused-country-ladybug \
+  --region us-east-2 \
+  --name standard \
+  --node-type t3.medium \
+  --nodes 2 \
+  --nodes-min 0 \
+  --nodes-max 3 \
+  --node-volume-size 30 \
+  --managed
+```
+
+> This takes 5–10 minutes. Once complete, verify with:
+> ```bash
+> aws-vault exec ese-sandbox -- kubectl get nodes
+> ```
 
 ---
 
@@ -131,30 +180,30 @@ spec:
 Apply it:
 
 ```bash
-aws-vault exec sso-tse-sandbox-account-admin -- kubectl apply -f deployment.yaml
+aws-vault exec ese-sandbox -- kubectl apply -f deployment.yaml
 ```
 
 Verify:
 
 ```bash
-aws-vault exec sso-tse-sandbox-account-admin -- kubectl get pods
+aws-vault exec ese-sandbox -- kubectl get pods
 ```
 
 ### Option B: Helm
 
 ```bash
-aws-vault exec sso-tse-sandbox-account-admin -- helm install my-release my-chart/
+aws-vault exec ese-sandbox -- helm install my-release my-chart/
 ```
 
 ---
 
 ## Useful Aliases
 
-Add these to your `~/.zshrc` or `~/.bashrc` to avoid typing the full `aws-vault` prefix every time:
+Add these to your `~/.zshrc` or `~/.bashrc`:
 
 ```bash
-alias av='aws-vault exec sso-tse-sandbox-account-admin --'
-alias avk='aws-vault exec sso-tse-sandbox-account-admin -- kubectl'
+alias av='aws-vault exec ese-sandbox --'
+alias avk='aws-vault exec ese-sandbox -- kubectl'
 ```
 
 Then reload:
@@ -174,56 +223,23 @@ av eksctl get nodegroup --cluster confused-country-ladybug --region us-east-2
 
 ---
 
-## Creating a New Cluster (optional)
-
-### 1. Install eksctl
-
-```bash
-brew install eksctl
-```
-
-### 2. Create a cluster.yaml
-
-```yaml
-apiVersion: eksctl.io/v1alpha5
-kind: ClusterConfig
-metadata:
-  name: FirstnameLastnameSandbox
-  region: us-east-2
-  tags:
-    creator: firstname.lastname
-    team: technical-support-engineer
-  version: "1.29"
-managedNodeGroups:
-  - name: standard
-    instanceType: t3.medium
-    desiredCapacity: 2
-    minSize: 0
-    volumeSize: 30
-```
-
-### 3. Create the cluster
-
-```bash
-aws-vault exec sso-tse-sandbox-account-admin -- eksctl create cluster -f cluster.yaml
-```
-
-> **Note:** If you hit quota errors (e.g., EIP limits), try a different region.
-
----
-
 ## Scaling Node Groups
 
 Scale down when not in use to save costs:
 
 ```bash
 # List node groups
-aws-vault exec sso-tse-sandbox-account-admin -- \
-  eksctl get nodegroup --cluster confused-country-ladybug --region us-east-2
+aws-vault exec ese-sandbox -- eksctl get nodegroup \
+  --cluster confused-country-ladybug --region us-east-2
 
 # Scale down to 0
-aws-vault exec sso-tse-sandbox-account-admin -- \
-  eksctl scale nodegroup --name standard --nodes=0 \
+aws-vault exec ese-sandbox -- eksctl scale nodegroup \
+  --name standard --nodes=0 \
+  --region us-east-2 --cluster confused-country-ladybug
+
+# Scale back up
+aws-vault exec ese-sandbox -- eksctl scale nodegroup \
+  --name standard --nodes=2 \
   --region us-east-2 --cluster confused-country-ladybug
 ```
 
@@ -234,7 +250,7 @@ aws-vault exec sso-tse-sandbox-account-admin -- \
 **Always delete your cluster when done** to free up AWS quotas:
 
 ```bash
-aws-vault exec sso-tse-sandbox-account-admin -- eksctl delete cluster -f cluster.yaml
+aws-vault exec ese-sandbox -- eksctl delete cluster --name confused-country-ladybug --region us-east-2
 ```
 
 > AWS Sandbox resources are automatically cleaned up after 90 days.
